@@ -1,0 +1,1375 @@
+---
+# Arm a disposable RHEL 10 VM as the ISS quest station computer UNITY-CORE.
+# Run only on a quest VM. Re-running this playbook throws every fault again.
+- name: Arm the ISS RHEL quest
+  hosts: iss
+  become: true
+  gather_facts: false
+  vars:
+    quest_admin_password: "ChangeMe-ISS-10"
+    quest_crew_password: "ISS-crew-10"
+    quest_reset_admin_password: true
+
+  tasks:
+    - name: Read SELinux mode
+      ansible.builtin.command: getenforce
+      register: selinux_mode
+      changed_when: false
+
+    - name: Refuse to arm the quest when SELinux is disabled
+      ansible.builtin.fail:
+        msg: >-
+          SELinux is Disabled. The Destiny riddle needs Enforcing, and a
+          disabled policy cannot be switched on without a relabel reboot.
+      when: selinux_mode.stdout == "Disabled"
+
+    - name: Switch permissive mode to enforcing for this run
+      ansible.builtin.command: setenforce 1
+      when: selinux_mode.stdout == "Permissive"
+      changed_when: true
+
+    - name: Persist enforcing mode
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: "^SELINUX="
+        line: SELINUX=enforcing
+      when: selinux_mode.stdout != "Disabled"
+
+    - name: Install the trainer packages
+      ansible.builtin.dnf:
+        name:
+          - chrony
+          - firewalld
+          - httpd
+          - policycoreutils-python-utils
+          - python3
+          - openssh-server
+          - openssh-clients
+          - rpm-build
+          - createrepo_c
+          - xfsprogs
+          - sudo
+          - NetworkManager
+          - iproute
+          - curl
+        state: present
+
+    - name: Enable NetworkManager and firewalld
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - NetworkManager
+        - firewalld
+
+    - name: Ensure the primary SSH daemon is active
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if systemctl is-active --quiet sshd; then
+          exit 0
+        fi
+        if systemctl is-active --quiet sshd.socket; then
+          exit 0
+        fi
+        systemctl enable --now sshd
+      changed_when: false
+
+    - name: Keep the ssh service in the permanent firewall configuration
+      ansible.builtin.command: firewall-cmd --permanent --add-service=ssh
+      changed_when: false
+
+    - name: Keep the ssh service in the runtime firewall configuration
+      ansible.builtin.command: firewall-cmd --add-service=ssh
+      changed_when: false
+
+    - name: Create the stationops group
+      ansible.builtin.group:
+        name: stationops
+        state: present
+
+    - name: Create the crew account
+      ansible.builtin.user:
+        name: crew
+        comment: ISS crew
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Create the ground account
+      ansible.builtin.user:
+        name: ground
+        comment: ISS ground link
+        shell: /bin/bash
+        create_home: true
+        password_lock: true
+        state: present
+
+    - name: Create the questadmin account
+      ansible.builtin.user:
+        name: questadmin
+        comment: Quest facilitator
+        shell: /bin/bash
+        groups: wheel
+        append: true
+        create_home: true
+        state: present
+      register: questadmin_created
+
+    - name: Set the questadmin password
+      ansible.builtin.shell: |
+        set -euo pipefail
+        printf '%s:%s\n' 'questadmin' "$QUEST_ADMIN_PASSWORD" | chpasswd
+      environment:
+        QUEST_ADMIN_PASSWORD: "{{ quest_admin_password }}"
+      no_log: true
+      changed_when: true
+      when: quest_reset_admin_password | bool or questadmin_created.changed
+
+    - name: Set the crew password and clear any lockout
+      ansible.builtin.shell: |
+        set -euo pipefail
+        printf '%s:%s\n' 'crew' "$QUEST_CREW_PASSWORD" | chpasswd
+        usermod -U crew
+        faillock --user crew --reset || true
+      environment:
+        QUEST_CREW_PASSWORD: "{{ quest_crew_password }}"
+      no_log: true
+      changed_when: true
+
+    - name: Take the crew badge away
+      ansible.builtin.command: gpasswd -d crew stationops
+      register: drop_stationops
+      changed_when: drop_stationops.rc == 0
+      failed_when: false
+
+    - name: Create the main quest directory
+      ansible.builtin.file:
+        path: "/var/quest"
+        state: directory
+        owner: root
+        group: root
+        mode: 755
+
+    - name: Create trainer directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - path: /var/quest/sealed
+          mode: "0700"
+          group: root
+        - path: /var/quest/progress
+          mode: "0755"
+          group: root
+        - path: /var/quest/flight-kit
+          mode: "0750"
+          group: stationops
+        - path: /usr/local/libexec
+          mode: "0755"
+          group: root
+        - path: /srv/iss/destiny
+          mode: "0755"
+          group: root
+        - path: /srv/iss/quest
+          mode: "0755"
+          group: root
+        - path: /srv/iss/columbus
+          mode: "0755"
+          group: root
+        - path: /var/lib/iss
+          mode: "0755"
+          group: root
+        - path: /var/lib/iss/repos/kibo
+          mode: "0755"
+          group: root
+        - path: /etc/systemd/journald.conf.d
+          mode: "0755"
+          group: root
+        - path: /etc/systemd/system/eclss.service.d
+          mode: "0755"
+          group: root
+        - path: /root/rpmbuild/SPECS
+          mode: "0700"
+          group: root
+        - path: /root/rpmbuild/SOURCES
+          mode: "0700"
+          group: root
+        - path: /root/rpmbuild/BUILD
+          mode: "0700"
+          group: root
+        - path: /root/rpmbuild/RPMS
+          mode: "0700"
+          group: root
+        - path: /root/rpmbuild/SRPMS
+          mode: "0700"
+          group: root
+        - path: /mnt/quest-build
+          mode: "0755"
+          group: root
+
+    - name: Install the beacon pass conditions
+      ansible.builtin.copy:
+        dest: /usr/local/libexec/iss-checks.sh
+        owner: root
+        group: root
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          # Pass conditions for the ISS RHEL quest.
+          # The score playbook carries its own copy of this file. Editing this copy
+          # on the station computer does not change the score.
+
+          export LANG=C
+          export LC_ALL=C
+
+          check_1() {
+            local tz stratum
+            tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+            [[ "$tz" == "UTC" ]] || { echo "timezone is ${tz:-unknown}, flight rule is UTC"; return 1; }
+            systemctl is-active --quiet chronyd || { echo "chronyd is not active"; return 1; }
+            systemctl is-enabled --quiet chronyd || { echo "chronyd is not enabled"; return 1; }
+            grep -Eq '^[[:space:]]*local[[:space:]]+stratum[[:space:]]+10([[:space:]]|$)' /etc/chrony.conf \
+              || { echo "/etc/chrony.conf has no local stratum 10 reference"; return 1; }
+            if grep -Eq '^[[:space:]]*(server|pool|peer)[[:space:]]+' /etc/chrony.conf; then
+              echo "an active server, pool, or peer line is still in /etc/chrony.conf"
+              return 1
+            fi
+            stratum=$(chronyc tracking 2>/dev/null | awk -F':' '/^Stratum/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+            [[ "$stratum" == "10" ]] || { echo "chronyc tracking stratum is ${stratum:-unknown}, flight rule is 10"; return 1; }
+          }
+
+          check_2() {
+            local sudo_l f mode owner g o found_beacon found_unlock
+            id -nG crew 2>/dev/null | tr ' ' '\n' | grep -qx stationops \
+              || { echo "crew is not a member of stationops"; return 1; }
+            sudo_l=$(sudo -n -l -U crew 2>/dev/null || true)
+            grep -Fq '/usr/local/bin/iss-beacon' <<<"$sudo_l" \
+              || { echo "sudo -l for crew does not list iss-beacon"; return 1; }
+            grep -Fq '/usr/local/bin/iss-unlock' <<<"$sudo_l" \
+              || { echo "sudo -l for crew does not list iss-unlock"; return 1; }
+            grep -q 'NOPASSWD' <<<"$sudo_l" \
+              || { echo "the crew badge still asks for a password"; return 1; }
+            if grep -E '^[[:space:]]+\(' <<<"$sudo_l" | grep -E -q '(^|[[:space:]])ALL([[:space:]]|$)'; then
+              echo "crew has an unrestricted sudo command (ALL)"
+              return 1
+            fi
+            found_beacon=0
+            found_unlock=0
+            shopt -s nullglob
+            for f in /etc/sudoers.d/*; do
+              [[ -f "$f" ]] || continue
+              mode=$(stat -c '%a' "$f")
+              owner=$(stat -c '%U:%G' "$f")
+              g=$(( (10#$mode / 10) % 10 ))
+              o=$(( 10#$mode % 10 ))
+              if (( (g & 2) || (o & 2) )); then
+                echo "$f is writable by group or other and sudo will ignore it"
+                return 1
+              fi
+              [[ "$owner" == "root:root" ]] || { echo "$f is not owned by root:root"; return 1; }
+              if grep -Eq '^[[:space:]]*%stationops[[:space:]]+' "$f" && grep -Fq '/usr/local/bin/iss-beacon' "$f"; then
+                found_beacon=1
+              fi
+              if grep -Eq '^[[:space:]]*%stationops[[:space:]]+' "$f" && grep -Fq '/usr/local/bin/iss-unlock' "$f"; then
+                found_unlock=1
+              fi
+            done
+            [[ "$found_beacon" == 1 && "$found_unlock" == 1 ]] \
+              || { echo "no root-owned sudoers.d rule grants %stationops the beacon and the unlock tool"; return 1; }
+            visudo -c >/dev/null 2>&1 || { echo "visudo -c rejected the sudoers configuration"; return 1; }
+          }
+
+          check_3() {
+            local enabled
+            enabled=$(systemctl is-enabled eclss.service 2>/dev/null || true)
+            [[ "$enabled" == "enabled" ]] || { echo "eclss.service is ${enabled:-missing}, flight rule is enabled"; return 1; }
+            systemctl is-active --quiet eclss.service || { echo "eclss.service is not active"; return 1; }
+            grep -qx 'ECLSS-NOMINAL' /run/iss/eclss.healthy 2>/dev/null \
+              || { echo "/run/iss/eclss.healthy is not ECLSS-NOMINAL"; return 1; }
+            if systemctl cat eclss.service 2>/dev/null | grep -q 'eclss-missing'; then
+              echo "the eclss drop-in still points at eclss-missing"
+              return 1
+            fi
+          }
+
+          check_4() {
+            local ctx
+            [[ "$(getenforce 2>/dev/null || true)" == "Enforcing" ]] || { echo "SELinux is not enforcing"; return 1; }
+            ctx=$(stat -c '%C' /srv/iss/destiny/index.html 2>/dev/null || true)
+            [[ "$ctx" == *httpd_sys_content_t* ]] || { echo "index.html context is ${ctx:-missing}"; return 1; }
+            semanage fcontext -l 2>/dev/null | grep '/srv/iss/destiny' | grep -q 'httpd_sys_content_t' \
+              || { echo "no permanent httpd_sys_content_t file context for /srv/iss/destiny"; return 1; }
+            systemctl is-active --quiet httpd || { echo "httpd is not active"; return 1; }
+            curl -fsS --max-time 5 http://127.0.0.1/index.html 2>/dev/null | grep -q 'DESTINY-SAMPLE-OK' \
+              || { echo "the Destiny page does not contain DESTINY-SAMPLE-OK"; return 1; }
+          }
+
+          check_5() {
+            local ip
+            firewall-cmd --query-port=8421/tcp >/dev/null 2>&1 || { echo "runtime firewall does not allow 8421/tcp"; return 1; }
+            firewall-cmd --permanent --query-port=8421/tcp >/dev/null 2>&1 || { echo "permanent firewall does not allow 8421/tcp"; return 1; }
+            systemctl is-active --quiet iss-airlock.service || { echo "iss-airlock.service is not active"; return 1; }
+            ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')
+            if [[ -z "${ip}" || "${ip}" == "127.0.0.1" ]]; then
+              ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            fi
+            if [[ -z "${ip}" || "${ip}" == "127.0.0.1" ]]; then
+              echo "no non-loopback IPv4 address to test the airlock"
+              return 1
+            fi
+            curl -fsS --max-time 5 "http://${ip}:8421/" 2>/dev/null | grep -q 'AIRLOCK-NOMINAL' \
+              || { echo "port 8421 on ${ip} did not return AIRLOCK-NOMINAL"; return 1; }
+          }
+
+          check_6() {
+            local state addrs
+            state=$(nmcli -g GENERAL.STATE connection show harmony 2>/dev/null || true)
+            [[ "$state" == activated* ]] || { echo "harmony state is ${state:-missing}"; return 1; }
+            addrs=$(ip -4 -o addr show dev iss-hnode 2>/dev/null | awk '{print $4}')
+            grep -qx '172.16.20.10/24' <<<"$addrs" || { echo "iss-hnode addresses are [${addrs:-none}]"; return 1; }
+            if grep -q '172.16.20.100' <<<"$addrs"; then
+              echo "the old address 172.16.20.100 is still configured"
+              return 1
+            fi
+            [[ "$(nmcli -g connection.autoconnect connection show harmony 2>/dev/null || true)" == "yes" ]] \
+              || { echo "harmony autoconnect is not yes"; return 1; }
+          }
+
+          check_7() {
+            local fstype opts line
+            local -a lines
+            findmnt -n /srv/iss/columbus >/dev/null 2>&1 || { echo "/srv/iss/columbus is not mounted"; return 1; }
+            fstype=$(findmnt -n -o FSTYPE /srv/iss/columbus)
+            opts=$(findmnt -n -o OPTIONS /srv/iss/columbus)
+            [[ "$fstype" == "xfs" ]] || { echo "Columbus fstype is ${fstype:-missing}"; return 1; }
+            grep -qw 'rw' <<<"$opts" || { echo "Columbus is not mounted read-write (${opts})"; return 1; }
+            grep -qx 'COLUMBUS-PAYLOAD-OK' /srv/iss/columbus/sample.dat 2>/dev/null \
+              || { echo "sample.dat is not the Columbus payload line"; return 1; }
+            mapfile -t lines < <(grep -v '^[[:space:]]*#' /etc/fstab | grep '/srv/iss/columbus' || true)
+            [[ -n "${lines[*]:-}" ]] || { echo "fstab has no Columbus mount"; return 1; }
+            for line in "${lines[@]}"; do
+              grep -q 'noauto' <<<"$line" && { echo "fstab still contains noauto for Columbus"; return 1; }
+              grep -q '00000000-0000-0000-0000-000000000000' <<<"$line" && { echo "fstab still has the placeholder UUID"; return 1; }
+              grep -q '/var/lib/iss/columbus.img' <<<"$line" || { echo "fstab does not reference the XFS image"; return 1; }
+              grep -qw 'loop' <<<"$line" || { echo "fstab is missing the loop option"; return 1; }
+              grep -qw 'xfs' <<<"$line" || { echo "fstab filesystem type is not xfs"; return 1; }
+            done
+          }
+
+          check_8() {
+            dnf repolist --enabled 2>/dev/null | grep -q 'iss-kibo' || { echo "repository iss-kibo is not enabled"; return 1; }
+            rpm -q iss-kibo-toolkit >/dev/null 2>&1 || { echo "package iss-kibo-toolkit is not installed"; return 1; }
+            /usr/bin/kibo-status 2>/dev/null | grep -qx 'KIBO-NOMINAL' \
+              || { echo "kibo-status did not print KIBO-NOMINAL (Columbus must be mounted)"; return 1; }
+          }
+
+          check_9() {
+            local effective mid
+            effective=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+              | sed -E 's/[[:space:]]*#.*$//' \
+              | awk -F= 'tolower($1) ~ /^[[:space:]]*storage[[:space:]]*$/ {v=tolower($2)} END {gsub(/[[:space:]]/, "", v); print v}')
+            [[ "$effective" == "persistent" ]] || { echo "effective Storage is ${effective:-unset}, flight rule is persistent"; return 1; }
+            systemctl is-active --quiet systemd-journald || { echo "systemd-journald is not active"; return 1; }
+            mid=$(cat /etc/machine-id)
+            shopt -s nullglob
+            local files=(/var/log/journal/"${mid}"/*)
+            [[ -n "${files[*]:-}" ]] || { echo "no journal files under /var/log/journal/${mid}"; return 1; }
+          }
+
+          check_10() {
+            local cfg
+            sshd -t -f /etc/ssh/sshd_config.ground >/dev/null 2>&1 || { echo "sshd -t rejected /etc/ssh/sshd_config.ground"; return 1; }
+            cfg=$(sshd -T -f /etc/ssh/sshd_config.ground 2>/dev/null || true)
+            grep -qi '^passwordauthentication no$' <<<"$cfg" || { echo "password authentication is still allowed"; return 1; }
+            grep -qi '^kbdinteractiveauthentication no$' <<<"$cfg" || { echo "keyboard-interactive authentication is still allowed"; return 1; }
+            grep -qi '^permitrootlogin no$' <<<"$cfg" || { echo "permitrootlogin is not no"; return 1; }
+            grep -qi '^port 2222$' <<<"$cfg" || { echo "ground sshd port is not 2222"; return 1; }
+            grep -qi '^allowusers ground$' <<<"$cfg" || { echo "allowusers is not exactly ground"; return 1; }
+            grep -qi '172.16.20.10' <<<"$cfg" || { echo "ground sshd does not listen on 172.16.20.10"; return 1; }
+            if grep -Ei '^listenaddress[[:space:]]+(0\.0\.0\.0|\[::\]|\*|::)(:|$)' <<<"$cfg"; then
+              echo "ground sshd listens on a wildcard address"
+              return 1
+            fi
+            semanage port -l 2>/dev/null | grep 'ssh_port_t' | grep -q '2222' \
+              || { echo "ssh_port_t does not include tcp/2222"; return 1; }
+            firewall-cmd --query-port=2222/tcp >/dev/null 2>&1 || { echo "runtime firewall does not allow 2222/tcp"; return 1; }
+            firewall-cmd --permanent --query-port=2222/tcp >/dev/null 2>&1 || { echo "permanent firewall does not allow 2222/tcp"; return 1; }
+            if ! firewall-cmd --query-service=ssh >/dev/null 2>&1 && ! firewall-cmd --query-port=22/tcp >/dev/null 2>&1; then
+              echo "the primary ssh service is no longer allowed"
+              return 1
+            fi
+            systemctl is-enabled --quiet sshd-ground.service || { echo "sshd-ground.service is not enabled"; return 1; }
+            systemctl is-active --quiet sshd-ground.service || { echo "sshd-ground.service is not active"; return 1; }
+            ssh -i /var/quest/flight-kit/ground_ed25519 -p 2222 \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=5 \
+              ground@172.16.20.10 true >/dev/null 2>&1 \
+              || { echo "key login as ground to 172.16.20.10:2222 failed"; return 1; }
+          }
+
+    - name: Install the module beacon
+      ansible.builtin.copy:
+        dest: /usr/local/bin/iss-beacon
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Module beacon for the ISS trainer. Prints a clearance code only when the
+          # flight rule for that module is met. Riddle 10 also re-checks riddles 1-9.
+
+          source /usr/local/libexec/iss-checks.sh
+
+          secret_for() {
+            case "$1" in
+              1) printf '%s\n' 4821 ;;
+              2) printf '%s\n' 7036 ;;
+              3) printf '%s\n' 9154 ;;
+              4) printf '%s\n' 2267 ;;
+              5) printf '%s\n' 3380 ;;
+              6) printf '%s\n' 4519 ;;
+              7) printf '%s\n' 5642 ;;
+              8) printf '%s\n' 6775 ;;
+              9) printf '%s\n' 7808 ;;
+              10) printf '%s\n' 8941 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          name_for() {
+            case "$1" in
+              1) printf '%s\n' Zarya ;;
+              2) printf '%s\n' Unity ;;
+              3) printf '%s\n' Zvezda ;;
+              4) printf '%s\n' Destiny ;;
+              5) printf '%s\n' Quest ;;
+              6) printf '%s\n' Harmony ;;
+              7) printf '%s\n' Columbus ;;
+              8) printf '%s\n' Kibo ;;
+              9) printf '%s\n' Tranquility ;;
+              10) printf '%s\n' Cupola ;;
+              *) return 1 ;;
+            esac
+          }
+
+          mark_lit() {
+            local n="$1"
+            mkdir -p /var/quest/progress
+            touch /var/quest/progress/unlocked
+            grep -qx "$n" /var/quest/progress/unlocked || printf '%s\n' "$n" >> /var/quest/progress/unlocked
+          }
+
+          if [[ "${1:-}" == "status" || "${1:-}" == "" ]]; then
+            for n in 1 2 3 4 5 6 7 8 9 10; do
+              if check_"$n" >/dev/null 2>&1; then
+                printf '%2d %-12s lit\n' "$n" "$(name_for "$n")"
+              else
+                printf '%2d %-12s dark\n' "$n" "$(name_for "$n")"
+              fi
+            done
+            exit 0
+          fi
+
+          if [[ ! "$1" =~ ^([1-9]|10)$ ]]; then
+            echo "usage: iss-beacon <1-10|status>" >&2
+            exit 2
+          fi
+
+          n="$1"
+
+          if [[ "$n" == "10" ]]; then
+            dark=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if ! reason=$(check_"$i"); then
+                echo "Beacon ${i} ($(name_for "$i")) is dark: ${reason}"
+                dark=1
+              fi
+            done
+            if [[ "$dark" -ne 0 ]]; then
+              echo "Alarm still active."
+              printf '%s\n' ACTIVE > /var/quest/ALARM
+              exit 1
+            fi
+            mark_lit 10
+            printf '%s\n' CLEARED > /var/quest/ALARM
+            echo "Cupola beacon is lit."
+            echo "ALARM CLEARED"
+            echo "Final clearance code: $(secret_for 10)"
+            echo "Mission code: $(secret_for 1)-$(secret_for 2)-$(secret_for 3)-$(secret_for 4)-$(secret_for 5)-$(secret_for 6)-$(secret_for 7)-$(secret_for 8)-$(secret_for 9)-$(secret_for 10)"
+            exit 0
+          fi
+
+          if ! reason=$(check_"$n"); then
+            echo "Beacon ${n} ($(name_for "$n")) is dark: ${reason}"
+            exit 1
+          fi
+
+          mark_lit "$n"
+          next=$((n + 1))
+          echo "$(name_for "$n") beacon is lit."
+          echo "Clearance code: $(secret_for "$n")"
+          echo "Open the next hatch with: sudo iss-unlock ${next} $(secret_for "$n")"
+
+    - name: Install the hatch keypad
+      ansible.builtin.copy:
+        dest: /usr/local/bin/iss-unlock
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Hatch keypad. Opens briefing N when beacon N-1 has been lit and the
+          # clearance code from that beacon is presented.
+
+          secret_for() {
+            case "$1" in
+              1) printf '%s\n' 4821 ;;
+              2) printf '%s\n' 7036 ;;
+              3) printf '%s\n' 9154 ;;
+              4) printf '%s\n' 2267 ;;
+              5) printf '%s\n' 3380 ;;
+              6) printf '%s\n' 4519 ;;
+              7) printf '%s\n' 5642 ;;
+              8) printf '%s\n' 6775 ;;
+              9) printf '%s\n' 7808 ;;
+              10) printf '%s\n' 8941 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          if [[ $# -ne 2 ]]; then
+            echo "usage: iss-unlock <next-riddle 2-10> <previous-clearance-code>" >&2
+            exit 2
+          fi
+
+          next="$1"
+          secret="$2"
+
+          if [[ ! "$next" =~ ^([2-9]|10)$ ]]; then
+            echo "The next hatch has to be a riddle from 2 to 10." >&2
+            exit 2
+          fi
+
+          prev=$((next - 1))
+          expected=$(secret_for "$prev") || exit 1
+
+          if [[ "$secret" != "$expected" ]]; then
+            echo "Hatch refused." >&2
+            exit 1
+          fi
+
+          if [[ ! -f /var/quest/progress/unlocked ]] || ! grep -qx "$prev" /var/quest/progress/unlocked; then
+            echo "The previous beacon is not lit." >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          files=(/var/quest/sealed/"$(printf '%02d' "$next")"-*.txt)
+          if [[ -z "${files[*]:-}" || "${files[*]}" == *" "* ]]; then
+            echo "Sealed briefing for hatch ${next} is missing." >&2
+            exit 1
+          fi
+
+          install -m 0644 "${files[0]}" /var/quest/briefing.txt
+          install -m 0644 "${files[0]}" /home/crew/current-briefing.txt
+          mkdir -p /var/quest/progress
+          printf '%s unlocked %s\n' "$(date -Is)" "$next" >> /var/quest/progress/hatch.log
+          echo "Hatch ${next} is open. Read /var/quest/briefing.txt"
+
+    - name: Install symlink iss-unlock for root
+      ansible.builtin.file:
+        src: /usr/local/bin/iss-unlock
+        dest: /usr/local/sbin/iss-unlock 
+        state: link
+
+    - name: Install symlink iss-beacon for root
+      ansible.builtin.file:
+        src: /usr/local/bin/iss-unlock
+        dest: /usr/local/sbin/iss-unlock
+        state: link
+
+    - name: allow root to user /usr/local/bin
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/custom-path
+        content: "Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin/"
+          
+    - name: Install sealed briefing 01-zarya.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/01-zarya.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Zarya (Functional Cargo Block)
+          Alarm: C&W TIME-SKEW
+
+          The station clock is not on Coordinated Universal Time, and chronyd is not
+          acting as the local time reference. This trainer has no usable NTP path to
+          the ground. Treat UNITY-CORE as the reference clock for an isolated network.
+
+          Flight rule:
+          - Time zone: UTC
+          - chronyd enabled and running
+          - /etc/chrony.conf provides a local reference at stratum 10
+          - No server, pool, or peer lines left active
+
+          When the module is healthy, run:
+
+              sudo iss-beacon 1
+
+          The beacon prints a four-digit clearance code. Open the next hatch with:
+
+              sudo iss-unlock 2 CODE
+
+          Guide: Configuring time synchronization, chapter "Using chrony"
+          (isolated network). Time zone: timedatectl in "Changing basic environment
+          settings".
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/configuring_time_synchronization/using-chrony
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/interactively_installing_rhel_over_the_network/changing-basic-environment-settings
+    - name: Install sealed briefing 02-unity.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/02-unity.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Unity (Node 1)
+          Alarm: HATCH-AUTH
+
+          The crew badge is not accepted. User crew must be a member of the group
+          stationops. That group must be allowed, through a file in /etc/sudoers.d,
+          to run only these commands as root, without a password:
+
+              /usr/local/bin/iss-beacon
+              /usr/local/bin/iss-unlock
+
+          A sudoers file that is writable by group or other is ignored. Granting the
+          group unrestricted root, or adding crew to wheel, leaves the hatch shut.
+
+          Verify with:
+
+              sudo iss-beacon 2
+
+          Guide: Security hardening, "Managing sudo access", and sudoers(5), usermod(8).
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/security_hardening/managing-sudo-access
+    - name: Install sealed briefing 03-zvezda.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/03-zvezda.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Zvezda (Service Module)
+          Alarm: ECLSS-TELEMETRY-DOWN
+
+          The environmental control unit eclss.service will not start. Inspect the
+          unit with systemctl status and systemctl cat, including drop-ins. The
+          service must be unmasked, enabled, and active, and /run/iss/eclss.healthy
+          must contain the line ECLSS-NOMINAL.
+
+              sudo iss-beacon 3
+
+          Guide: Using systemd unit files to customize and optimize your system.
+          Drop-in files, masking, and enabling a service.
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html-single/using_systemd_unit_files_to_customize_and_optimize_your_system/index
+    - name: Install sealed briefing 04-destiny.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/04-destiny.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Destiny (US Laboratory)
+          Alarm: LAB-CONTENT-DENIED
+
+          The laboratory index at http://127.0.0.1/index.html is denied. The document
+          root is /srv/iss/destiny. SELinux is in enforcing mode and must stay there.
+          The files need a permanent httpd content label. A boolean that lets httpd
+          read home directories is not the repair.
+
+          The page contains DESTINY-SAMPLE-OK when the repair is complete.
+
+              sudo iss-beacon 4
+
+          Guide: Using SELinux, "Troubleshooting problems related to SELinux"
+          (labeling problems and non-standard directories).
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/using_selinux/troubleshooting-problems-related-to-selinux
+    - name: Install sealed briefing 05-quest.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/05-quest.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Quest (Airlock)
+          Alarm: AIRLOCK-PORT-CLOSED
+
+          The airlock beacon listens on TCP port 8421. iss-airlock.service is already
+          running. firewalld is dropping that port. Open 8421/tcp in the default zone
+          and make the change permanent. Leave the ssh service allowed.
+
+          Loopback is in the trusted zone, so a test against 127.0.0.1 does not prove
+          the airlock is open. Test the host's non-loopback address. The body contains
+          AIRLOCK-NOMINAL.
+
+              sudo iss-beacon 5
+
+          Guide: Configuring firewalls and packet filters, "Controlling network
+          traffic by using firewalld". Custom ports use firewall-cmd --add-port and
+          firewall-cmd --runtime-to-permanent, the same persistence step as the
+          service procedure and the non-default SSH port procedure.
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/configuring_firewalls_and_packet_filters/using-and-configuring-firewalld
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/securing_networks/using-secure-communications-between-two-systems-with-openssh
+    - name: Install sealed briefing 06-harmony.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/06-harmony.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Harmony (Node 2)
+          Alarm: NODE2-BUS-DOWN
+
+          The internal bus profile harmony on interface iss-hnode is down and has the
+          wrong address. Flight rule:
+
+          - IPv4 address 172.16.20.10/24
+          - method manual
+          - no gateway and no DNS on this bus
+          - connection.autoconnect yes
+          - connection active
+
+          Leave the primary NIC and the default route alone. Configure the existing
+          profile with nmcli and bring it up.
+
+              sudo iss-beacon 6
+
+          Guide: Configuring and managing networking, "Configuring an Ethernet
+          connection by using nmcli" (static IPv4 and nmcli connection up). The same
+          ipv4.* properties apply to this profile.
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html-single/configuring_and_managing_networking/index
+    - name: Install sealed briefing 07-columbus.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/07-columbus.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Columbus (European laboratory)
+          Alarm: PAYLOAD-VOLUME-OFFLINE
+
+          The Columbus sample is an XFS image at /var/lib/iss/columbus.img. It must be
+          mounted on /srv/iss/columbus, read-write, and the mount must persist across
+          reboot through /etc/fstab. The current fstab entry is a placeholder. The
+          mounted file sample.dat contains the single line COLUMBUS-PAYLOAD-OK.
+
+          Use a loop mount of that image file. Leave the image file where it is.
+
+              sudo iss-beacon 7
+
+          Guide: Managing file systems, "Persistently mounting file systems".
+          The loop option is described in mount(8) and fstab(5).
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/managing_file_systems/persistently-mounting-file-systems
+    - name: Install sealed briefing 08-kibo.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/08-kibo.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Kibo (Japanese Experiment Module)
+          Alarm: TOOLKIT-ABSENT
+
+          The local repository iss-kibo is disabled. Enable it and install the
+          package iss-kibo-toolkit. The repository is unsigned and local to this
+          trainer (baseurl file:///var/lib/iss/repos/kibo). gpgcheck is already off.
+          This pattern is for the trainer only.
+
+          /usr/bin/kibo-status must print KIBO-NOMINAL. It reads the Columbus sample,
+          so that volume has to be mounted.
+
+              sudo iss-beacon 8
+
+          Guide: Managing software with the DNF tool, "Managing custom software
+          repositories".
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html-single/managing_software_with_the_dnf_tool/index
+    - name: Install sealed briefing 09-tranquility.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/09-tranquility.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Tranquility (Node 3)
+          Alarm: JOURNAL-VOLATILE
+
+          The station journal is not persistent. A drop-in is forcing volatile
+          storage. The effective configuration must set Storage=persistent.
+          Journal files must exist under /var/log/journal/<machine-id>.
+          See the merged configuration with:
+
+              systemd-analyze cat-config systemd/journald.conf
+
+              sudo iss-beacon 9
+
+          Guide: Automating system administration by using RHEL system roles,
+          "Configuring the systemd journal" (persistent logging and the
+          /var/log/journal verification). On this single host, set that end state
+          in journald configuration. See journald.conf(5), Storage=.
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/automating_system_administration_by_using_rhel_system_roles/configuring-the-systemd-journal-by-using-rhel-system-roles
+    - name: Install sealed briefing 10-cupola.txt
+      ansible.builtin.copy:
+        dest: /var/quest/sealed/10-cupola.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Module: Cupola
+          Alarm: GROUND-LINK-DOWN
+
+          The ground link is a second OpenSSH daemon, sshd-ground.service, with its
+          own configuration file /etc/ssh/sshd_config.ground. Leave the primary sshd
+          on port 22 unchanged, and leave the ssh service in the firewall.
+
+          Flight rule for the ground link:
+          - sshd -t -f /etc/ssh/sshd_config.ground succeeds
+          - ListenAddress 172.16.20.10 and Port 2222
+          - PasswordAuthentication no
+          - KbdInteractiveAuthentication no
+          - PermitRootLogin no
+          - AllowUsers ground
+          - PubkeyAuthentication yes
+          - SELinux type ssh_port_t includes tcp/2222
+          - firewalld allows 2222/tcp in the runtime and the permanent configuration
+          - sshd-ground.service is enabled and active
+          - A key login as ground to 172.16.20.10 port 2222 succeeds
+
+          The private key is /var/quest/flight-kit/ground_ed25519. Harmony must
+          already be up, because the daemon binds only that address. The host keys
+          are the system host keys already in /etc/ssh. Do not add a HostKey path.
+
+              sudo iss-beacon 10
+
+          A lit beacon means every earlier module is still healthy. The final line
+          is the all-clear.
+
+          Guide: Securing networks, "Using secure communications between two systems
+          with OpenSSH".
+          - Setting key-based authentication as the only method
+          - Setting a non-default port for SSH (semanage port and firewalld)
+          - SSH access only for specific users
+          https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/securing_networks/using-secure-communications-between-two-systems-with-openssh
+
+    - name: Open the Zarya briefing
+      ansible.builtin.copy:
+        src: /var/quest/sealed/01-zarya.txt
+        dest: "{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - /var/quest/briefing.txt
+        - /home/crew/current-briefing.txt
+
+    - name: Reset hatch progress
+      ansible.builtin.copy:
+        dest: /var/quest/progress/unlocked
+        owner: root
+        group: root
+        mode: "0644"
+        content: ""
+
+    - name: Raise the master alarm
+      ansible.builtin.copy:
+        dest: /var/quest/ALARM
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          ACTIVE
+
+    - name: Install the login banner
+      ansible.builtin.copy:
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          *** C&W CLASS 1  ECLSS-COMM-LOST ***
+          This trainer is UNITY-CORE.
+          Read /var/quest/briefing.txt
+          Beacons: sudo iss-beacon <1-10>
+          Next hatch: sudo iss-unlock <next> <code>
+          Leave the primary SSH service on port 22 alone.
+
+    - name: Install the player pointer
+      ansible.builtin.copy:
+        dest: /var/quest/README.txt
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          UNITY-CORE trainer.
+          Read /var/quest/briefing.txt and repair that module.
+          sudo iss-beacon <1-10> prints a clearance code when the flight rule is met.
+          sudo iss-unlock <next> <code> opens the next briefing.
+          Leave the primary SSH service on port 22 and the primary NIC alone.
+          Reading the beacon script is outside the exercise. The score inspects the system.
+
+    - name: Remove a previously repaired stationops sudo rule
+      ansible.builtin.file:
+        path: /etc/sudoers.d/stationops
+        state: absent
+
+    - name: Plant the ignored crew sudoers file
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/crew
+        owner: root
+        group: root
+        mode: "0666"
+        content: |
+          # Ignored while this file is writable by others. Also the wrong rule.
+          crew ALL=(ALL) ALL
+
+    - name: Remove the previous ground key
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/quest/flight-kit/ground_ed25519
+        - /var/quest/flight-kit/ground_ed25519.pub
+
+    - name: Create the ground flight-kit key
+      ansible.builtin.command: ssh-keygen -t ed25519 -N "" -C iss-ground -f /var/quest/flight-kit/ground_ed25519 -q
+      changed_when: true
+
+    - name: Let stationops read the ground private key
+      ansible.builtin.file:
+        path: /var/quest/flight-kit/ground_ed25519
+        owner: root
+        group: stationops
+        mode: "0640"
+
+    - name: Publish the ground public key
+      ansible.builtin.file:
+        path: /var/quest/flight-kit/ground_ed25519.pub
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the ground public key
+      ansible.builtin.slurp:
+        src: /var/quest/flight-kit/ground_ed25519.pub
+      register: ground_pub
+
+    - name: Install the ground authorized key
+      ansible.posix.authorized_key:
+        user: ground
+        key: "{{ ground_pub.content | b64decode }}"
+        state: present
+        exclusive: true
+
+    - name: Install the Kibo status helper source
+      ansible.builtin.copy:
+        dest: /root/rpmbuild/SOURCES/kibo-status
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          payload=/srv/iss/columbus/sample.dat
+          if [[ -r "${payload}" ]] && grep -qx 'COLUMBUS-PAYLOAD-OK' "${payload}"; then
+            printf '%s\n' 'KIBO-NOMINAL'
+            exit 0
+          fi
+          printf '%s\n' 'KIBO-WAITING-FOR-COLUMBUS' >&2
+          exit 1
+
+    - name: Install the Kibo toolkit spec
+      ansible.builtin.copy:
+        dest: /root/rpmbuild/SPECS/iss-kibo-toolkit.spec
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Name:           iss-kibo-toolkit
+          Version:        1.0.0
+          Release:        1%{?dist}
+          Summary:        Kibo Exposed Facility status helper for the ISS trainer
+          License:        MIT
+          BuildArch:      noarch
+          Source0:        kibo-status
+
+          %global debug_package %{nil}
+          %global _build_id_links none
+
+          %description
+          Reports whether the Columbus payload sample is mounted and readable.
+          This package is part of the RHEL quest trainer. It is not a Red Hat product.
+
+          %prep
+
+          %build
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          install -m 0755 %{SOURCE0} %{buildroot}/usr/bin/kibo-status
+
+          %files
+          /usr/bin/kibo-status
+
+    - name: Remove the Kibo toolkit if a previous team installed it
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if rpm -q iss-kibo-toolkit >/dev/null 2>&1; then
+          dnf remove -y iss-kibo-toolkit
+        fi
+      register: kibo_remove
+      changed_when: "'Removed' in kibo_remove.stdout"
+
+    - name: Build the Kibo toolkit RPM
+      ansible.builtin.command: rpmbuild -bb /root/rpmbuild/SPECS/iss-kibo-toolkit.spec
+      changed_when: true
+
+    - name: Publish the disabled Kibo repository
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rm -rf /var/lib/iss/repos/kibo
+        mkdir -p /var/lib/iss/repos/kibo
+        cp /root/rpmbuild/RPMS/noarch/iss-kibo-toolkit-*.rpm /var/lib/iss/repos/kibo/
+        createrepo_c /var/lib/iss/repos/kibo
+      changed_when: true
+
+    - name: Leave the Kibo repository disabled
+      ansible.builtin.copy:
+        dest: /etc/yum.repos.d/iss-kibo.repo
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [iss-kibo]
+          name=ISS Kibo local toolkit
+          baseurl=file:///var/lib/iss/repos/kibo
+          enabled=0
+          gpgcheck=0
+
+    - name: Unmount a previous Columbus payload
+      ansible.builtin.command: umount /srv/iss/columbus
+      failed_when: false
+      changed_when: false
+
+    - name: Recreate the Columbus XFS image
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rm -f /var/lib/iss/columbus.img
+        truncate -s 512M /var/lib/iss/columbus.img
+        mkfs.xfs -f /var/lib/iss/columbus.img
+        mount -o loop /var/lib/iss/columbus.img /mnt/quest-build
+        printf '%s\n' 'COLUMBUS-PAYLOAD-OK' > /mnt/quest-build/sample.dat
+        sync
+        umount /mnt/quest-build
+      changed_when: true
+
+    - name: Plant the broken Columbus fstab entry
+      ansible.builtin.blockinfile:
+        path: /etc/fstab
+        marker: "# {mark} ISS-COLUMBUS"
+        block: |
+          UUID=00000000-0000-0000-0000-000000000000 /srv/iss/columbus xfs noauto,ro 0 0
+
+    - name: Install the Destiny document root
+      ansible.builtin.copy:
+        dest: /srv/iss/destiny/index.html
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><title>Destiny sample</title></head>
+          <body><p>DESTINY-SAMPLE-OK</p></body>
+          </html>
+
+    - name: Install the Destiny httpd snippet
+      ansible.builtin.copy:
+        dest: /etc/httpd/conf.d/destiny.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          DocumentRoot "/srv/iss/destiny"
+          <Directory "/srv/iss/destiny">
+              AllowOverride None
+              Require all granted
+          </Directory>
+
+    - name: Drop any permanent Destiny file-context rules
+      ansible.builtin.shell: |
+        set -euo pipefail
+        semanage fcontext -l -C | awk '/iss\/destiny/ {print $1}' | while read -r spec; do
+          semanage fcontext -d "$spec" || true
+        done
+      changed_when: false
+
+    - name: Label the Destiny tree as a moved home directory
+      ansible.builtin.command: chcon -R -t user_home_t /srv/iss/destiny
+      changed_when: true
+
+    - name: Leave the home-content boolean off
+      ansible.builtin.command: setsebool -P httpd_read_user_content 0
+      changed_when: false
+
+    - name: Enable and restart httpd so the denial is visible
+      ansible.builtin.systemd:
+        name: httpd
+        enabled: true
+        state: restarted
+
+    - name: Install the Quest airlock page
+      ansible.builtin.copy:
+        dest: /srv/iss/quest/index.html
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          AIRLOCK-NOMINAL
+
+    - name: Install the Quest airlock unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/iss-airlock.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=ISS Quest airlock beacon
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 -m http.server 8421 --bind 0.0.0.0 --directory /srv/iss/quest
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable the Quest airlock
+      ansible.builtin.systemd:
+        name: iss-airlock.service
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Install the ECLSS simulator
+      ansible.builtin.copy:
+        dest: /usr/local/libexec/eclss-sim
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          mkdir -p /run/iss
+          printf '%s\n' ECLSS-NOMINAL > /run/iss/eclss.healthy
+          exec sleep infinity
+
+    - name: Install the ECLSS unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/eclss.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=ISS ECLSS telemetry simulator
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/libexec/eclss-sim
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Plant the broken ECLSS drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/eclss.service.d/override.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/local/libexec/eclss-missing
+
+    - name: Stop ECLSS and remove a stale health file
+      ansible.builtin.shell: |
+        set -euo pipefail
+        systemctl daemon-reload
+        systemctl stop eclss.service || true
+        rm -f /run/iss/eclss.healthy
+      changed_when: true
+
+#    - name: Mask ECLSS
+#      ansible.builtin.command: systemctl mask --now eclss.service
+#      changed_when: true
+
+    - name: Install the broken Cupola sshd configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.ground
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Port 2222
+          ListenAddress 172.16.20.10
+          PidFile /run/sshd-ground.pid
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          PermitRootLogin yes
+          PubkeyAuthentication yes
+          AllowUsers
+          Subsystem sftp /usr/libexec/openssh/sftp-server
+
+    - name: Install the Cupola ground-link unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/sshd-ground.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=ISS Cupola ground link
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config.ground
+          ExecReload=/bin/kill -HUP $MAINPID
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Stop and disable the Cupola ground link
+      ansible.builtin.systemd:
+        name: sshd-ground.service
+        enabled: false
+        state: stopped
+        daemon_reload: true
+
+    - name: Remove the Cupola SELinux port label if a team added it
+      ansible.builtin.command: semanage port -d -t ssh_port_t -p tcp 2222
+      register: drop_ssh_port
+      failed_when: false
+      changed_when: drop_ssh_port.rc == 0
+
+    - name: Close the ports the team has to open, and keep ssh allowed
+      ansible.builtin.shell: |
+        set -euo pipefail
+        firewall-cmd --permanent --add-service=ssh
+        firewall-cmd --permanent --remove-port=8421/tcp || true
+        firewall-cmd --permanent --remove-port=2222/tcp || true
+        firewall-cmd --reload
+        firewall-cmd --add-service=ssh
+      changed_when: true
+
+    - name: Remove journald drop-ins from a previous attempt
+      ansible.builtin.shell: |
+        set -euo pipefail
+        find /etc/systemd/journald.conf.d -maxdepth 1 -type f -name '*.conf' -delete
+      changed_when: false
+
+    - name: Force volatile journal storage
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/zz-volatile.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Journal]
+          Storage=volatile
+
+#    - name: Comment Storage= in the main journald file
+#      ansible.builtin.replace:
+#        path: /etc/systemd/journald.conf
+#        regexp: "^[#[:space:]]*Storage=.*$"
+#        replace: "#Storage=auto"
+
+    - name: Remove the persistent journal directory
+      ansible.builtin.file:
+        path: /var/log/journal
+        state: absent
+
+    - name: Restart journald on the volatile store
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+
+    - name: Leave the Harmony internal bus down on the wrong address
+      ansible.builtin.shell: |
+        set -euo pipefail
+        nmcli connection delete harmony >/dev/null 2>&1 || true
+        ip link delete iss-hnode >/dev/null 2>&1 || true
+        nmcli connection add type dummy ifname iss-hnode con-name harmony \
+          ipv4.method manual ipv4.addresses 172.16.20.100/24 \
+          ipv6.method disabled connection.autoconnect no
+        nmcli connection modify harmony \
+          ipv4.method manual \
+          ipv4.addresses 172.16.20.100/24 \
+          ipv6.method disabled \
+          connection.autoconnect no \
+          connection.interface-name iss-hnode
+        nmcli connection down harmony >/dev/null 2>&1 || true
+      changed_when: true
+
+    - name: Install the broken chrony configuration
+      ansible.builtin.copy:
+        dest: /etc/chrony.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Quest fault: no local reference, one unreachable documentation server.
+          driftfile /var/lib/chrony/drift
+          makestep 1.0 3
+          rtcsync
+          logdir /var/log/chrony
+          server 198.51.100.10 iburst
+
+    - name: Stop chrony and set the test time zone
+      ansible.builtin.shell: |
+        set -euo pipefail
+        timedatectl set-ntp false || true
+        systemctl disable --now chronyd || true
+        timedatectl set-timezone Pacific/Kiritimati
+      changed_when: true
+
+    - name: Make sure Harmony stayed down
+      ansible.builtin.command: nmcli connection down harmony
+      failed_when: false
+      changed_when: true
+
+    - name: Prove the primary SSH daemon is still active
+      ansible.builtin.shell: |
+        set -euo pipefail
+        systemctl is-active --quiet sshd || systemctl is-active --quiet sshd.socket
+      changed_when: false
+
+    - name: Prove the firewall still allows ssh
+      ansible.builtin.command: firewall-cmd --query-service=ssh
+      changed_when: false
+
+    - name: Report that the trainer is armed
+      ansible.builtin.debug:
+        msg: >-
+          UNITY-CORE is armed. The player briefing is /var/quest/briefing.txt.
+          Hand out the questadmin account out of band. Do not give the team
+          the facilitator guide; it contains the clearance codes.

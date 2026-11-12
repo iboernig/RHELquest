@@ -1,0 +1,267 @@
+---
+# Score the ISS quest from a facilitator workstation.
+# This playbook carries its own copy of the pass conditions. It does not
+# call /usr/local/bin/iss-beacon, so an edited beacon cannot raise the score.
+- name: Score the ISS RHEL quest
+  hosts: iss
+  become: true
+  gather_facts: false
+  vars:
+    quest_strict: false
+
+  tasks:
+    - name: Evaluate every module on the live system
+      ansible.builtin.shell: |
+        #!/bin/bash
+        # Pass conditions for the ISS RHEL quest.
+        # The score playbook carries its own copy of this file. Editing this copy
+        # on the station computer does not change the score.
+
+        export LANG=C
+        export LC_ALL=C
+
+        check_1() {
+          local tz stratum
+          tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+          [[ "$tz" == "UTC" ]] || { echo "timezone is ${tz:-unknown}, flight rule is UTC"; return 1; }
+          systemctl is-active --quiet chronyd || { echo "chronyd is not active"; return 1; }
+          systemctl is-enabled --quiet chronyd || { echo "chronyd is not enabled"; return 1; }
+          grep -Eq '^[[:space:]]*local[[:space:]]+stratum[[:space:]]+10([[:space:]]|$)' /etc/chrony.conf \
+            || { echo "/etc/chrony.conf has no local stratum 10 reference"; return 1; }
+          if grep -Eq '^[[:space:]]*(server|pool|peer)[[:space:]]+' /etc/chrony.conf; then
+            echo "an active server, pool, or peer line is still in /etc/chrony.conf"
+            return 1
+          fi
+          stratum=$(chronyc tracking 2>/dev/null | awk -F':' '/^Stratum/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+          [[ "$stratum" == "10" ]] || { echo "chronyc tracking stratum is ${stratum:-unknown}, flight rule is 10"; return 1; }
+        }
+
+        check_2() {
+          local sudo_l f mode owner g o found_beacon found_unlock
+          id -nG crew 2>/dev/null | tr ' ' '\n' | grep -qx stationops \
+            || { echo "crew is not a member of stationops"; return 1; }
+          sudo_l=$(sudo -n -l -U crew 2>/dev/null || true)
+          grep -Fq '/usr/local/bin/iss-beacon' <<<"$sudo_l" \
+            || { echo "sudo -l for crew does not list iss-beacon"; return 1; }
+          grep -Fq '/usr/local/bin/iss-unlock' <<<"$sudo_l" \
+            || { echo "sudo -l for crew does not list iss-unlock"; return 1; }
+          grep -q 'NOPASSWD' <<<"$sudo_l" \
+            || { echo "the crew badge still asks for a password"; return 1; }
+          if grep -E '^[[:space:]]+\(' <<<"$sudo_l" | grep -E -q '(^|[[:space:]])ALL([[:space:]]|$)'; then
+            echo "crew has an unrestricted sudo command (ALL)"
+            return 1
+          fi
+          found_beacon=0
+          found_unlock=0
+          shopt -s nullglob
+          for f in /etc/sudoers.d/*; do
+            [[ -f "$f" ]] || continue
+            mode=$(stat -c '%a' "$f")
+            owner=$(stat -c '%U:%G' "$f")
+            g=$(( (10#$mode / 10) % 10 ))
+            o=$(( 10#$mode % 10 ))
+            if (( (g & 2) || (o & 2) )); then
+              echo "$f is writable by group or other and sudo will ignore it"
+              return 1
+            fi
+            [[ "$owner" == "root:root" ]] || { echo "$f is not owned by root:root"; return 1; }
+            if grep -Eq '^[[:space:]]*%stationops[[:space:]]+' "$f" && grep -Fq '/usr/local/bin/iss-beacon' "$f"; then
+              found_beacon=1
+            fi
+            if grep -Eq '^[[:space:]]*%stationops[[:space:]]+' "$f" && grep -Fq '/usr/local/bin/iss-unlock' "$f"; then
+              found_unlock=1
+            fi
+          done
+          [[ "$found_beacon" == 1 && "$found_unlock" == 1 ]] \
+            || { echo "no root-owned sudoers.d rule grants %stationops the beacon and the unlock tool"; return 1; }
+          visudo -c >/dev/null 2>&1 || { echo "visudo -c rejected the sudoers configuration"; return 1; }
+        }
+
+        check_3() {
+          local enabled
+          enabled=$(systemctl is-enabled eclss.service 2>/dev/null || true)
+          [[ "$enabled" == "enabled" ]] || { echo "eclss.service is ${enabled:-missing}, flight rule is enabled"; return 1; }
+          systemctl is-active --quiet eclss.service || { echo "eclss.service is not active"; return 1; }
+          grep -qx 'ECLSS-NOMINAL' /run/iss/eclss.healthy 2>/dev/null \
+            || { echo "/run/iss/eclss.healthy is not ECLSS-NOMINAL"; return 1; }
+          if systemctl cat eclss.service 2>/dev/null | grep -q 'eclss-missing'; then
+            echo "the eclss drop-in still points at eclss-missing"
+            return 1
+          fi
+        }
+
+        check_4() {
+          local ctx
+          [[ "$(getenforce 2>/dev/null || true)" == "Enforcing" ]] || { echo "SELinux is not enforcing"; return 1; }
+          ctx=$(stat -c '%C' /srv/iss/destiny/index.html 2>/dev/null || true)
+          [[ "$ctx" == *httpd_sys_content_t* ]] || { echo "index.html context is ${ctx:-missing}"; return 1; }
+          semanage fcontext -l 2>/dev/null | grep '/srv/iss/destiny' | grep -q 'httpd_sys_content_t' \
+            || { echo "no permanent httpd_sys_content_t file context for /srv/iss/destiny"; return 1; }
+          systemctl is-active --quiet httpd || { echo "httpd is not active"; return 1; }
+          curl -fsS --max-time 5 http://127.0.0.1/index.html 2>/dev/null | grep -q 'DESTINY-SAMPLE-OK' \
+            || { echo "the Destiny page does not contain DESTINY-SAMPLE-OK"; return 1; }
+        }
+
+        check_5() {
+          local ip
+          firewall-cmd --query-port=8421/tcp >/dev/null 2>&1 || { echo "runtime firewall does not allow 8421/tcp"; return 1; }
+          firewall-cmd --permanent --query-port=8421/tcp >/dev/null 2>&1 || { echo "permanent firewall does not allow 8421/tcp"; return 1; }
+          systemctl is-active --quiet iss-airlock.service || { echo "iss-airlock.service is not active"; return 1; }
+          ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}')
+          if [[ -z "${ip}" || "${ip}" == "127.0.0.1" ]]; then
+            ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+          fi
+          if [[ -z "${ip}" || "${ip}" == "127.0.0.1" ]]; then
+            echo "no non-loopback IPv4 address to test the airlock"
+            return 1
+          fi
+          curl -fsS --max-time 5 "http://${ip}:8421/" 2>/dev/null | grep -q 'AIRLOCK-NOMINAL' \
+            || { echo "port 8421 on ${ip} did not return AIRLOCK-NOMINAL"; return 1; }
+        }
+
+        check_6() {
+          local state addrs
+          state=$(nmcli -g GENERAL.STATE connection show harmony 2>/dev/null || true)
+          [[ "$state" == activated* ]] || { echo "harmony state is ${state:-missing}"; return 1; }
+          addrs=$(ip -4 -o addr show dev iss-hnode 2>/dev/null | awk '{print $4}')
+          grep -qx '172.16.20.10/24' <<<"$addrs" || { echo "iss-hnode addresses are [${addrs:-none}]"; return 1; }
+          if grep -q '172.16.20.100' <<<"$addrs"; then
+            echo "the old address 172.16.20.100 is still configured"
+            return 1
+          fi
+          [[ "$(nmcli -g connection.autoconnect connection show harmony 2>/dev/null || true)" == "yes" ]] \
+            || { echo "harmony autoconnect is not yes"; return 1; }
+        }
+
+        check_7() {
+          local fstype opts line
+          local -a lines
+          findmnt -n /srv/iss/columbus >/dev/null 2>&1 || { echo "/srv/iss/columbus is not mounted"; return 1; }
+          fstype=$(findmnt -n -o FSTYPE /srv/iss/columbus)
+          opts=$(findmnt -n -o OPTIONS /srv/iss/columbus)
+          [[ "$fstype" == "xfs" ]] || { echo "Columbus fstype is ${fstype:-missing}"; return 1; }
+          grep -qw 'rw' <<<"$opts" || { echo "Columbus is not mounted read-write (${opts})"; return 1; }
+          grep -qx 'COLUMBUS-PAYLOAD-OK' /srv/iss/columbus/sample.dat 2>/dev/null \
+            || { echo "sample.dat is not the Columbus payload line"; return 1; }
+          mapfile -t lines < <(grep -v '^[[:space:]]*#' /etc/fstab | grep '/srv/iss/columbus' || true)
+          [[ -n "${lines[*]:-}" ]] || { echo "fstab has no Columbus mount"; return 1; }
+          for line in "${lines[@]}"; do
+            grep -q 'noauto' <<<"$line" && { echo "fstab still contains noauto for Columbus"; return 1; }
+            grep -q '00000000-0000-0000-0000-000000000000' <<<"$line" && { echo "fstab still has the placeholder UUID"; return 1; }
+            grep -q '/var/lib/iss/columbus.img' <<<"$line" || { echo "fstab does not reference the XFS image"; return 1; }
+            grep -qw 'loop' <<<"$line" || { echo "fstab is missing the loop option"; return 1; }
+            grep -qw 'xfs' <<<"$line" || { echo "fstab filesystem type is not xfs"; return 1; }
+          done
+        }
+
+        check_8() {
+          dnf repolist --enabled 2>/dev/null | grep -q 'iss-kibo' || { echo "repository iss-kibo is not enabled"; return 1; }
+          rpm -q iss-kibo-toolkit >/dev/null 2>&1 || { echo "package iss-kibo-toolkit is not installed"; return 1; }
+          /usr/bin/kibo-status 2>/dev/null | grep -qx 'KIBO-NOMINAL' \
+            || { echo "kibo-status did not print KIBO-NOMINAL (Columbus must be mounted)"; return 1; }
+        }
+
+        check_9() {
+          local effective mid
+          effective=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+            | sed -E 's/[[:space:]]*#.*$//' \
+            | awk -F= 'tolower($1) ~ /^[[:space:]]*storage[[:space:]]*$/ {v=tolower($2)} END {gsub(/[[:space:]]/, "", v); print v}')
+          [[ "$effective" == "persistent" ]] || { echo "effective Storage is ${effective:-unset}, flight rule is persistent"; return 1; }
+          systemctl is-active --quiet systemd-journald || { echo "systemd-journald is not active"; return 1; }
+          mid=$(cat /etc/machine-id)
+          shopt -s nullglob
+          local files=(/var/log/journal/"${mid}"/*)
+          [[ -n "${files[*]:-}" ]] || { echo "no journal files under /var/log/journal/${mid}"; return 1; }
+        }
+
+        check_10() {
+          local cfg
+          sshd -t -f /etc/ssh/sshd_config.ground >/dev/null 2>&1 || { echo "sshd -t rejected /etc/ssh/sshd_config.ground"; return 1; }
+          cfg=$(sshd -T -f /etc/ssh/sshd_config.ground 2>/dev/null || true)
+          grep -qi '^passwordauthentication no$' <<<"$cfg" || { echo "password authentication is still allowed"; return 1; }
+          grep -qi '^kbdinteractiveauthentication no$' <<<"$cfg" || { echo "keyboard-interactive authentication is still allowed"; return 1; }
+          grep -qi '^permitrootlogin no$' <<<"$cfg" || { echo "permitrootlogin is not no"; return 1; }
+          grep -qi '^port 2222$' <<<"$cfg" || { echo "ground sshd port is not 2222"; return 1; }
+          grep -qi '^allowusers ground$' <<<"$cfg" || { echo "allowusers is not exactly ground"; return 1; }
+          grep -qi '172.16.20.10' <<<"$cfg" || { echo "ground sshd does not listen on 172.16.20.10"; return 1; }
+          if grep -Ei '^listenaddress[[:space:]]+(0\.0\.0\.0|\[::\]|\*|::)(:|$)' <<<"$cfg"; then
+            echo "ground sshd listens on a wildcard address"
+            return 1
+          fi
+          semanage port -l 2>/dev/null | grep 'ssh_port_t' | grep -q '2222' \
+            || { echo "ssh_port_t does not include tcp/2222"; return 1; }
+          firewall-cmd --query-port=2222/tcp >/dev/null 2>&1 || { echo "runtime firewall does not allow 2222/tcp"; return 1; }
+          firewall-cmd --permanent --query-port=2222/tcp >/dev/null 2>&1 || { echo "permanent firewall does not allow 2222/tcp"; return 1; }
+          if ! firewall-cmd --query-service=ssh >/dev/null 2>&1 && ! firewall-cmd --query-port=22/tcp >/dev/null 2>&1; then
+            echo "the primary ssh service is no longer allowed"
+            return 1
+          fi
+          systemctl is-enabled --quiet sshd-ground.service || { echo "sshd-ground.service is not enabled"; return 1; }
+          systemctl is-active --quiet sshd-ground.service || { echo "sshd-ground.service is not active"; return 1; }
+          ssh -i /var/quest/flight-kit/ground_ed25519 -p 2222 \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 \
+            ground@172.16.20.10 true >/dev/null 2>&1 \
+            || { echo "key login as ground to 172.16.20.10:2222 failed"; return 1; }
+        }
+
+        names=(
+          "Zarya — time reference"
+          "Unity — crew badge"
+          "Zvezda — ECLSS service"
+          "Destiny — SELinux label"
+          "Quest — airlock port"
+          "Harmony — internal bus"
+          "Columbus — payload volume"
+          "Kibo — toolkit package"
+          "Tranquility — persistent journal"
+          "Cupola — ground link"
+        )
+        points=0
+        printf '%s\n' "ISS QUEST SCORE"
+        printf '%s\n' "Host: $(hostname -f 2>/dev/null || hostname)"
+        printf '%s\n' "When: $(date -Is)"
+        printf '\n'
+        for n in 1 2 3 4 5 6 7 8 9 10; do
+          if reason=$(check_"$n"); then
+            printf 'R%-2s PASS  %s\n' "$n" "${names[$((n - 1))]}"
+            points=$((points + 10))
+          else
+            printf 'R%-2s FAIL  %s — %s\n' "$n" "${names[$((n - 1))]}" "$reason"
+          fi
+        done
+        printf '\n'
+        printf 'Score: %s / 100\n' "$points"
+        if [[ "$points" -eq 100 ]]; then
+          printf '%s\n' "Alarm: CLEARED"
+          printf '%s\n' "Mission code: 4821-7036-9154-2267-3380-4519-5642-6775-7808-8941"
+        else
+          printf '%s\n' "Alarm: ACTIVE"
+        fi
+        exit 0
+      args:
+        executable: /bin/bash
+      register: score_run
+      changed_when: false
+      failed_when: false
+
+    - name: Write the score next to the playbook
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/quest-score.txt"
+        mode: "0644"
+        content: "{{ score_run.stdout }}\n"
+      delegate_to: localhost
+      become: false
+
+    - name: Show the score
+      ansible.builtin.debug:
+        msg: "{{ score_run.stdout }}"
+
+    - name: Fail the run when strict mode is on and the alarm is still active
+      ansible.builtin.fail:
+        msg: "The alarm is still active. The report above lists the dark modules."
+      when:
+        - quest_strict | bool
+        - "'ALARM CLEARED' not in score_run.stdout"
